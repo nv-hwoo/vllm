@@ -9,13 +9,19 @@ allowing a sidecar process to access and transfer them using RDMA.
 Usage:
     Pass `worker_extension_cls="rdma_sidecar.rdma_sidecar_extension.RDMASidecarExtension"`
     when initializing vLLM.
-"""
 
+Auto-start weight server:
+    Set RDMA_ZMQ_ADDRESS env var to auto-start the weight server on model load.
+    Example: RDMA_ZMQ_ADDRESS=ipc:///tmp/rdma.sock
+"""
+import json
+import os
+import threading
 from dataclasses import dataclass
 from enum import StrEnum, auto
+from pathlib import Path
 from typing import Any
 
-import threading
 import torch
 import zmq
 from pydantic import BaseModel
@@ -127,7 +133,7 @@ class RDMASidecarExtension:
         return sum(info.metadata.nbytes for info in self._weight_infos.values())
 
     def _ensure_weight_infos(self) -> None:
-        """Lazily build weight info cache."""
+        """Lazily build weight info cache and auto-start weight server if configured."""
         if getattr(self, "_weight_infos", None) is not None:
             return
 
@@ -159,6 +165,25 @@ class RDMASidecarExtension:
                 data_ptr=tensor.data_ptr(),
                 ipc_handle=ipc_handle,
             )
+
+        # Auto-start weight server if RDMA_ZMQ_ADDRESS is set
+        zmq_address = os.environ.get("RDMA_ZMQ_ADDRESS")
+        if zmq_address and getattr(self, "_server_thread", None) is None:
+            # Ensure socket directory exists
+            if zmq_address.startswith("ipc://"):
+                Path(zmq_address[6:]).parent.mkdir(parents=True, exist_ok=True)
+            
+            # Export metadata to file for receiver
+            metadata_path = os.environ.get("RDMA_METADATA_PATH", "/tmp/rdma_weight_metadata.json")
+            Path(metadata_path).parent.mkdir(parents=True, exist_ok=True)
+            metadata_list = [info.metadata.model_dump() for info in self._weight_infos.values()]
+            Path(metadata_path).write_text(json.dumps(metadata_list))
+            
+            self.start_weight_server(zmq_address)
+            total_gb = sum(info.metadata.nbytes for info in self._weight_infos.values()) / 1e9
+            print(f"[RDMA] Weight server auto-started: {zmq_address}")
+            print(f"[RDMA] {len(self._weight_infos)} tensors, {total_gb:.2f} GB total")
+            print(f"[RDMA] Metadata exported to: {metadata_path}")
 
     def start_weight_server(self, zmq_address: str) -> None:
         """
