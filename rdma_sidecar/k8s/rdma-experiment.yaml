@@ -23,7 +23,17 @@ spec:
   selector:
     app: sender
 ---
-# Sender: vLLM OpenAI server + RDMA sidecar
+apiVersion: v1
+kind: Service
+metadata:
+  name: receiver
+  namespace: rdma-exp
+spec:
+  clusterIP: None
+  selector:
+    app: receiver
+---
+# Sender: vLLM OpenAI server with integrated RDMA orchestration
 apiVersion: v1
 kind: Pod
 metadata:
@@ -34,17 +44,83 @@ spec:
   nodeSelector: {rdma: sender}
   hostIPC: true
   containers:
-    # Standard vLLM OpenAI server - weight server started via collective_rpc from sidecar
     - name: vllm
       image: vllm/vllm-openai:latest
+      command: [bash, -c]
       args:
-        - --model=facebook/opt-125m
-        - --host=0.0.0.0
-        - --port=8000
-        - --gpu-memory-utilization=0.8
-        - --max-model-len=2048
-        - --enforce-eager
-        - --worker-extension-cls=rdma_sidecar_extension.RDMASidecarExtension
+        - |
+          # Start vLLM server in background
+          python -m vllm.entrypoints.openai.api_server \
+            --model facebook/opt-125m \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --gpu-memory-utilization 0.8 \
+            --max-model-len 2048 \
+            --enforce-eager \
+            --worker-extension-cls rdma_sidecar_extension.RDMASidecarExtension &
+          VLLM_PID=$!
+          
+          # Run sidecar orchestration inline
+          python -c "
+          import time, json, requests, subprocess, sys, os, socket
+          sys.path.insert(0, '/code')
+          from pathlib import Path
+          
+          VLLM_URL = 'http://localhost:8000'
+          ZMQ_ADDR = 'ipc:///ipc/weights.sock'
+          
+          print('Waiting for vLLM server...')
+          for _ in range(300):
+              try:
+                  if requests.get(f'{VLLM_URL}/health', timeout=2).ok:
+                      print('vLLM ready!')
+                      break
+              except: pass
+              time.sleep(2)
+          else:
+              print('vLLM failed to start'); sys.exit(1)
+          
+          print('Starting weight server via collective_rpc...')
+          Path('/ipc').mkdir(exist_ok=True)
+          
+          resp = requests.post(f'{VLLM_URL}/collective_rpc', json={
+              'method': 'start_weight_server',
+              'args': [ZMQ_ADDR],
+          }, timeout=60)
+          print(f'start_weight_server response: {resp.status_code}')
+          
+          resp = requests.post(f'{VLLM_URL}/collective_rpc', json={
+              'method': 'get_model_weight_metadata',
+              'args': [],
+          }, timeout=60)
+          if resp.ok:
+              meta = resp.json()
+              if meta and len(meta) > 0:
+                  Path('/ipc/metadata.json').write_text(json.dumps(meta[0]))
+                  print(f'Exported metadata: {len(meta[0])} tensors')
+          
+          print('Waiting for receiver to be ready...')
+          while True:
+              try:
+                  socket.gethostbyname('receiver.rdma-exp.svc.cluster.local')
+                  print('Receiver is ready!')
+                  break
+              except socket.gaierror:
+                  pass
+              time.sleep(2)
+          
+          print('Starting RDMA transfer...')
+          os.chdir('/code')
+          subprocess.run(['python', 'rdma_sidecar.py',
+              '--zmq-address', ZMQ_ADDR,
+              '--master-addr', subprocess.check_output(['hostname', '-i']).decode().strip(),
+              '--master-port', '29500',
+              '--verbose'
+          ])
+          "
+          
+          # Keep vLLM running
+          wait $VLLM_PID
       env:
         - {name: PYTHONPATH, value: "/code"}
         - {name: CUDA_VISIBLE_DEVICES, value: "0"}
@@ -64,77 +140,6 @@ spec:
         httpGet: {path: /health, port: 8000}
         initialDelaySeconds: 120
         periodSeconds: 5
-    
-    - name: sidecar
-      image: vllm/vllm-openai:latest
-      command: [python, -c]
-      args:
-        - |
-          import time, json, requests, subprocess, sys, os
-          sys.path.insert(0, '/code')
-          from pathlib import Path
-          
-          VLLM_URL = "http://localhost:8000"
-          ZMQ_ADDR = "ipc:///ipc/weights.sock"
-          
-          # Wait for vLLM to be ready
-          print("Waiting for vLLM server...")
-          for _ in range(300):
-              try:
-                  if requests.get(f"{VLLM_URL}/health", timeout=2).ok:
-                      print("vLLM ready!")
-                      break
-              except: pass
-              time.sleep(2)
-          else:
-              print("vLLM failed to start"); sys.exit(1)
-          
-          # Call collective_rpc to start weight server
-          print(f"Starting weight server via collective_rpc...")
-          Path("/ipc").mkdir(exist_ok=True)
-          
-          resp = requests.post(f"{VLLM_URL}/collective_rpc", json={
-              "method": "start_weight_server",
-              "args": [ZMQ_ADDR],
-          }, timeout=60)
-          print(f"start_weight_server response: {resp.status_code}")
-          
-          # Get metadata
-          resp = requests.post(f"{VLLM_URL}/collective_rpc", json={
-              "method": "get_model_weight_metadata",
-              "args": [],
-          }, timeout=60)
-          if resp.ok:
-              meta = resp.json()
-              if meta and len(meta) > 0:
-                  Path("/ipc/metadata.json").write_text(json.dumps(meta[0]))
-                  print(f"Exported metadata: {len(meta[0])} tensors")
-          
-          # Wait for receiver
-          print("Waiting for receiver (30s)...")
-          time.sleep(30)
-          
-          # Run RDMA transfer
-          print("Starting RDMA transfer...")
-          os.chdir("/code")
-          os.execvp("python", ["python", "rdma_sidecar.py",
-              "--zmq-address", ZMQ_ADDR,
-              "--master-addr", subprocess.check_output(["hostname", "-i"]).decode().strip(),
-              "--master-port", "29500",
-              "--verbose"
-          ])
-      env:
-        - {name: PYTHONPATH, value: "/code"}
-        - {name: NCCL_DEBUG, value: "INFO"}
-        - {name: CUDA_VISIBLE_DEVICES, value: "0"}
-      resources:
-        limits: {nvidia.com/gpu: "1"}
-        requests: {nvidia.com/gpu: "1", memory: 8Gi, cpu: "2"}
-      volumeMounts:
-        - {name: code, mountPath: /code}
-        - {name: ipc, mountPath: /ipc}
-        - {name: shm, mountPath: /dev/shm}
-      securityContext: {privileged: true}
   
   volumes:
     - {name: code, configMap: {name: rdma-code}}
